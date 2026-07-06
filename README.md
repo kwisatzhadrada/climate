@@ -66,14 +66,19 @@ lib/
   supabase/{client,server,middleware}.ts
   weather/{geocode,openMeteo,cache}.ts  Open-Meteo integrations + Postgres-backed caching
   ai/{client,service,riskReport}.ts     client = provider transport, service = governed entry point
-  rateLimit.ts                      Burst/abuse protection (Upstash, in-memory fallback)
+  stripe/tier.ts                    Pure "which tier for this subscription" decision (unit-testable)
+  rateLimit.ts                      Burst/abuse protection (Upstash; fails closed in production)
   quota.ts                          Hard per-tier monthly caps (the financial backstop)
   idempotency.ts                    Request-level idempotency for expensive/side-effecting calls
+  env.ts                            isProductionRuntime() + required-env-var checks
   types.ts
 supabase/migrations/
   001_initial.sql                   Schema, RLS policies, storage bucket
   002_hardening.sql                 stripe_events, idempotency_keys, climate_cache, ai_usage_log
+  003_ai_usage_references.sql       Links ai_usage_log to property_id/report_id
+instrumentation.ts                  Boot-time warning if production is missing required env vars
 middleware.ts                       Session refresh + /dashboard route guard
+test/                               Vitest suite for quota/idempotency/tier/cost logic (see Testing)
 ```
 
 ## Setup
@@ -87,11 +92,11 @@ npm install
 ### 2. Supabase project
 
 1. Create a project at [supabase.com](https://supabase.com).
-2. In the SQL editor, run `supabase/migrations/001_initial.sql`, then
-   `supabase/migrations/002_hardening.sql` in order. The first creates `profiles`,
-   `properties`, `risk_reports`, RLS policies, the new-user trigger, and the public
-   `property-photos` storage bucket; the second adds `stripe_events` (webhook dedupe),
-   `idempotency_keys`, `climate_cache`, and `ai_usage_log`.
+2. In the SQL editor, run the three migrations in `supabase/migrations/` **in order**:
+   `001_initial.sql` (`profiles`, `properties`, `risk_reports`, RLS policies, the new-user
+   trigger, and the public `property-photos` storage bucket), `002_hardening.sql`
+   (`stripe_events`, `idempotency_keys`, `climate_cache`, `ai_usage_log`), then
+   `003_ai_usage_references.sql` (links `ai_usage_log` to the property/report it was for).
 3. Copy your project URL, anon key, and service role key (Project Settings → API).
 
 ### 3. Environment variables
@@ -108,8 +113,8 @@ Fill in:
 - Stripe keys only if you want live checkout; the app degrades gracefully without them (the
   "Upgrade" button returns a friendly "not configured yet" message instead of erroring).
 - `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (free tier at [upstash.com](https://upstash.com))
-  — strongly recommended before public launch; without them, rate limiting silently falls back to
-  a single-instance in-memory limiter that does not protect a multi-instance deployment.
+  — optional for local dev (falls back to an in-memory limiter), but **mandatory in
+  production** — see [Production deployment checklist](#production-deployment-checklist).
 
 ### 4. Run
 
@@ -128,6 +133,77 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 ```
 
 Copy the printed webhook signing secret into `STRIPE_WEBHOOK_SECRET`.
+
+## Production deployment checklist
+
+Rate limiting behaves differently by environment, on purpose:
+
+- **Local development** (`npm run dev`, no `VERCEL_ENV`, `NODE_ENV` ≠ `production`): if Upstash
+  isn't configured, `lib/rateLimit.ts` falls back to an in-memory sliding window and logs a
+  one-time `console.warn`. Fine for a single dev process.
+- **Production** (`VERCEL_ENV=production`, or `NODE_ENV=production` with no `VERCEL_ENV` at all —
+  e.g. `next build && next start` on your own server): if Upstash isn't configured, rate limiting
+  **fails closed**. `checkRateLimit` throws `RateLimitingUnavailableError` instead of silently
+  running unprotected, and the three endpoints that matter most for cost/abuse —
+  `POST /api/properties`, `POST /api/properties/[id]/risk-report`, and
+  `POST /api/stripe/checkout` — return **HTTP 503** with a message pointing back to this section,
+  instead of processing the request.
+
+  Note for Vercel: preview deployments also get `NODE_ENV=production` from Next.js itself, but
+  Vercel additionally sets `VERCEL_ENV=preview`, which this app treats as *not* production — so
+  preview deployments use the in-memory fallback and won't 503 without Upstash configured for
+  that environment. Only `VERCEL_ENV=production` (or a non-Vercel host with no `VERCEL_ENV` at
+  all) triggers fail-closed behavior.
+
+Before deploying to production, confirm:
+
+- [ ] **`UPSTASH_REDIS_REST_URL`** and **`UPSTASH_REDIS_REST_TOKEN`** are set (mandatory — the
+      app will 503 on the three endpoints above without them; free tier at
+      [upstash.com](https://upstash.com) is enough to start).
+- [ ] All three Supabase migrations (`001`, `002`, `003`) have been run against the production
+      project, in order.
+- [ ] `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` are set — without either, every report
+      generation call fails (there's no rate-limit-style hard block for this today; it just
+      errors per-request).
+- [ ] `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PREMIUM_PRICE_ID`,
+      `STRIPE_BUSINESS_PRICE_ID` are set if you want live billing (the app degrades to a friendly
+      "not configured" message without them, but that also means no revenue).
+- [ ] The Stripe webhook endpoint (`/api/stripe/webhook`) is registered in the Stripe dashboard
+      for `checkout.session.completed`, `customer.subscription.updated`, and
+      `customer.subscription.deleted` — the downgrade-on-cancellation logic depends on the latter
+      two actually being delivered.
+- [ ] Server boot logs have been checked once after deploy for the `FATAL (production
+      configuration)` block (see `instrumentation.ts` / `lib/env.ts`) — if it's there, something
+      above is still missing.
+
+## Testing
+
+```bash
+npm test
+```
+
+Runs the Vitest suite in `test/`, which covers the pure business logic behind the hardening
+pass against mocked Supabase clients — no live Supabase/Stripe/Anthropic project needed:
+
+- `test/quota.test.ts` — free tier blocks a 2nd property and a 4th report/30-days; premium's
+  higher ceiling behaves the same way at its own threshold.
+- `test/idempotency.test.ts` — two requests with the same `Idempotency-Key` invoke the handler
+  (i.e. the AI call) exactly once; a failed handler frees the claim for retry; a genuinely
+  concurrent duplicate is rejected rather than double-run.
+- `test/stripeTier.test.ts` — `resolveTierForSubscription` (the webhook's downgrade decision)
+  grants the paid tier while active/trialing and returns `free` for canceled, unpaid, past_due,
+  incomplete_expired, or an unrecognized price.
+- `test/aiCost.test.ts` — `estimateCostUsd` math for known models, and `null` (not a guess) for
+  an unrecognized one.
+
+**What this doesn't cover, and needs a real Supabase/Stripe/Anthropic project to verify:**
+the actual RLS policies, the `stripe_events`/`idempotency_keys` unique constraints under real
+Postgres, an actual Stripe webhook round-trip (signature verification, `listLineItems`), a real
+AI call's token usage shape, and `ai_usage_log` rows actually landing with `property_id`/
+`report_id` populated end-to-end. If you want that level of verification, point a throwaway
+Supabase project's credentials at this app (locally or in a preview deployment) and walk through
+the free-tier quota, idempotency-header, and Stripe test-mode-cancellation scenarios by hand —
+happy to do that pass with you once there's a project to test against.
 
 ## Validation & launch steps
 
@@ -158,9 +234,9 @@ a real payment processor. What's now in place:
   account per month. Tune the numbers in `TIER_LIMITS` once you know real AI cost and margin.
 - **Burst-abuse rate limiting** (`lib/rateLimit.ts`) — Upstash Redis sliding window (5
   reports/min, 10 property-creates/min, 10 checkout attempts/min) protects against a script
-  hammering an endpoint within the quota window. Falls back to an in-memory limiter if Upstash
-  isn't configured — fine for local dev, **not sufficient for a multi-instance production
-  deployment** (logs a one-time warning so this doesn't fail silently).
+  hammering an endpoint within the quota window. In development, falls back to an in-memory
+  limiter if Upstash isn't configured; in production it **fails closed** instead — see
+  [Production deployment checklist](#production-deployment-checklist).
 - **Climate data caching** (`lib/weather/cache.ts`) — Open-Meteo responses are cached in
   Postgres per ~1km lat/lon bucket for 6 hours, so regenerating a report (or two nearby
   properties) doesn't re-hit the upstream API every time.
@@ -177,10 +253,12 @@ a real payment processor. What's now in place:
 - **Unified AI service layer** (`lib/ai/service.ts`) — the one place every feature's AI calls
   should go through: enforces a 30s timeout per call (so a hung provider request can't tie up a
   serverless invocation indefinitely), and logs every call's provider/model/token
-  usage/estimated cost/success to `ai_usage_log`. Deliberately does not add its own retry loop —
-  `lib/ai/client.ts` already falls back to a second provider once, and a visible failure that
-  lets the user re-click is safer than an automatic retry silently doubling spend on a flaky
-  request. Feature 2/3 AI calls should call `runAIJob(...)`, not `lib/ai/client.ts` directly.
+  usage/estimated cost/success to `ai_usage_log`, tagged with `user_id` and `property_id` at call
+  time and patched with `report_id` once the report row exists (`attachReportId`). Deliberately
+  does not add its own retry loop — `lib/ai/client.ts` already falls back to a second provider
+  once, and a visible failure that lets the user re-click is safer than an automatic retry
+  silently doubling spend on a flaky request. Feature 2/3 AI calls should call `runAIJob(...)`,
+  not `lib/ai/client.ts` directly.
 
 **Still open** (call these out before public launch, not before Feature 2):
 

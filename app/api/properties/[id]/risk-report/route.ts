@@ -2,8 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { getCachedClimateSnapshot } from "@/lib/weather/cache";
 import { generateRiskReport } from "@/lib/ai/riskReport";
+import { attachReportId } from "@/lib/ai/service";
 import type { ImageInput } from "@/lib/ai/client";
-import { checkRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
+import { enforceRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
 import { assertWithinReportQuota, getSubscriptionTier, QuotaExceededError } from "@/lib/quota";
 import { withIdempotency, IdempotencyInFlightError } from "@/lib/idempotency";
 import type { RiskReport } from "@/lib/types";
@@ -40,12 +41,9 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
-  const rateLimit = await checkRateLimit(`risk-report:${user.id}`, RATE_LIMITS.riskReportGenerate);
-  if (!rateLimit.success) {
-    return NextResponse.json(
-      { error: "Too many report requests. Please wait a minute and try again." },
-      { status: 429 }
-    );
+  const rateLimitError = await enforceRateLimit(`risk-report:${user.id}`, RATE_LIMITS.riskReportGenerate);
+  if (rateLimitError) {
+    return NextResponse.json({ error: rateLimitError.error }, { status: rateLimitError.status });
   }
 
   const { data: property, error: propertyError } = await supabase
@@ -90,8 +88,9 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
           property.photo_url ? fetchImageAsBase64(property.photo_url) : Promise.resolve(undefined),
         ]);
 
-        const { payload, model } = await generateRiskReport({
+        const { payload, model, usageLogId } = await generateRiskReport({
           userId: user.id,
+          propertyId: property.id,
           label: property.label,
           address: property.address,
           lat: property.lat!,
@@ -122,6 +121,11 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
           // under this idempotency key.
           throw new Error(insertError.message);
         }
+
+        // Best-effort: link the ai_usage_log row (written inside
+        // generateRiskReport, before this report existed) back to the report
+        // it produced, so usage/cost is traceable to a specific report.
+        await attachReportId(usageLogId, report.id);
 
         return { body: { report }, status: 201 };
       }

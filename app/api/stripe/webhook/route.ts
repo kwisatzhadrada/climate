@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { createServiceClient } from "@/lib/supabase/server";
+import { resolveTierForSubscription } from "@/lib/stripe/tier";
 
 const PRICE_TO_TIER: Record<string, "premium" | "business"> = {
   ...(process.env.STRIPE_PREMIUM_PRICE_ID ? { [process.env.STRIPE_PREMIUM_PRICE_ID]: "premium" } : {}),
@@ -69,14 +70,14 @@ async function handleSubscriptionChange(
 
   if (!profile) return; // No matching account (or checkout.session.completed hasn't landed yet).
 
-  const isActive = ACTIVE_STATUSES.includes(subscription.status);
-  const priceId = subscription.items.data[0]?.price?.id;
-  const tier = isActive && priceId ? PRICE_TO_TIER[priceId] : undefined;
+  const tier = resolveTierForSubscription({
+    status: subscription.status,
+    priceId: subscription.items.data[0]?.price?.id,
+    activeStatuses: ACTIVE_STATUSES,
+    priceToTier: PRICE_TO_TIER,
+  });
 
-  await supabase
-    .from("profiles")
-    .update({ subscription_tier: tier ?? "free" })
-    .eq("id", profile.id);
+  await supabase.from("profiles").update({ subscription_tier: tier }).eq("id", profile.id);
 }
 
 export async function POST(request: NextRequest) {

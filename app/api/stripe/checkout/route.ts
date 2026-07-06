@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { createClient } from "@/lib/supabase/server";
-import { checkRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
+import { enforceRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
 
 const PRICE_IDS: Record<string, string | undefined> = {
   premium: process.env.STRIPE_PREMIUM_PRICE_ID,
@@ -25,9 +25,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
-  const rateLimit = await checkRateLimit(`stripe-checkout:${user.id}`, RATE_LIMITS.stripeCheckout);
-  if (!rateLimit.success) {
-    return NextResponse.json({ error: "Too many requests. Please try again shortly." }, { status: 429 });
+  const rateLimitError = await enforceRateLimit(`stripe-checkout:${user.id}`, RATE_LIMITS.stripeCheckout);
+  if (rateLimitError) {
+    return NextResponse.json({ error: rateLimitError.error }, { status: rateLimitError.status });
   }
 
   const { tier } = await request.json();

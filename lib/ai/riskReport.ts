@@ -69,14 +69,15 @@ function extractJson(text: string): unknown {
 
 export async function generateRiskReport(params: {
   userId: string;
+  propertyId: string;
   label: string;
   address: string;
   lat: number;
   lon: number;
   climate: ClimateSnapshot;
   image?: ImageInput;
-}): Promise<{ payload: RiskReportPayload; model: string }> {
-  const { userId, label, address, lat, lon, climate, image } = params;
+}): Promise<{ payload: RiskReportPayload; model: string; usageLogId: string | null }> {
+  const { userId, propertyId, label, address, lat, lon, climate, image } = params;
 
   const prompt = `Property: ${label}
 Address: ${address}
@@ -100,6 +101,7 @@ Generate the JSON risk report now.`;
   const result = await runAIJob({
     feature: "climate_risk_report",
     userId,
+    propertyId,
     system: SYSTEM_PROMPT,
     prompt,
     image,
@@ -107,5 +109,5 @@ Generate the JSON risk report now.`;
   const parsed = extractJson(result.text);
   const payload = riskReportSchema.parse(parsed);
 
-  return { payload, model: `${result.provider}:${result.model}` };
+  return { payload, model: `${result.provider}:${result.model}`, usageLogId: result.usageLogId };
 }

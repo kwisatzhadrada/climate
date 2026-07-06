@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { geocodeAddress } from "@/lib/weather/geocode";
-import { checkRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
+import { enforceRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
 import { assertWithinPropertyQuota, getSubscriptionTier, QuotaExceededError } from "@/lib/quota";
 
 export async function POST(request: NextRequest) {
@@ -14,12 +14,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
-  const rateLimit = await checkRateLimit(`property-create:${user.id}`, RATE_LIMITS.propertyCreate);
-  if (!rateLimit.success) {
-    return NextResponse.json(
-      { error: "Too many requests. Please slow down and try again shortly." },
-      { status: 429 }
-    );
+  const rateLimitError = await enforceRateLimit(`property-create:${user.id}`, RATE_LIMITS.propertyCreate);
+  if (rateLimitError) {
+    return NextResponse.json({ error: rateLimitError.error }, { status: rateLimitError.status });
   }
 
   const body = await request.json();

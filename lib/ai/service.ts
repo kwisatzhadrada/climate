@@ -13,7 +13,7 @@ const PRICING_PER_1K_TOKENS: Record<string, { input: number; output: number }> =
   "gpt-4o-mini": { input: 0.00015, output: 0.0006 },
 };
 
-function estimateCostUsd(model: string, usage: TokenUsage | null): number | null {
+export function estimateCostUsd(model: string, usage: TokenUsage | null): number | null {
   if (!usage) return null;
   const pricingKey = Object.keys(PRICING_PER_1K_TOKENS).find((key) => model.includes(key));
   if (!pricingKey) return null;
@@ -27,6 +27,9 @@ export interface AIJobParams {
    * every AI call in the app on one shared cost/usage ledger. */
   feature: string;
   userId: string;
+  /** Optional foreign keys so ai_usage_log rows can be traced back to the
+   * specific property/report they were generated for, not just the user. */
+  propertyId?: string;
   system: string;
   prompt: string;
   image?: ImageInput;
@@ -36,6 +39,10 @@ export interface AIJobResult {
   text: string;
   model: string;
   provider: "anthropic" | "openai";
+  /** id of the ai_usage_log row written for this call, if logging succeeded.
+   * Callers that only learn a related id (e.g. the risk_reports row) after
+   * this call returns can patch it in with `attachReportId`. */
+  usageLogId: string | null;
 }
 
 /**
@@ -44,7 +51,8 @@ export interface AIJobResult {
  * directly) gets, for free:
  *   - a hard timeout, so a hung provider request can't tie up a serverless
  *     invocation (and its billed duration) indefinitely
- *   - usage/cost logging to ai_usage_log, keyed by feature and user
+ *   - usage/cost logging to ai_usage_log, keyed by feature, user, and
+ *     property (report is attached afterward — see attachReportId)
  *   - one consistent error shape
  *
  * Deliberately does NOT retry on failure — lib/ai/client.ts already falls
@@ -53,7 +61,7 @@ export interface AIJobResult {
  * automatic retry loop silently doubling AI spend on a flaky request.
  */
 export async function runAIJob(params: AIJobParams): Promise<AIJobResult> {
-  const { feature, userId, system, prompt, image } = params;
+  const { feature, userId, propertyId, system, prompt, image } = params;
   const supabase = createServiceClient();
 
   const controller = new AbortController();
@@ -62,9 +70,10 @@ export async function runAIJob(params: AIJobParams): Promise<AIJobResult> {
   try {
     const result = await generateStructuredText({ system, prompt, image, signal: controller.signal });
 
-    await logUsage(supabase, {
+    const usageLogId = await logUsage(supabase, {
       userId,
       feature,
+      propertyId,
       provider: result.provider,
       model: result.model,
       usage: result.usage,
@@ -72,13 +81,14 @@ export async function runAIJob(params: AIJobParams): Promise<AIJobResult> {
       error: null,
     });
 
-    return { text: result.text, model: result.model, provider: result.provider };
+    return { text: result.text, model: result.model, provider: result.provider, usageLogId };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
 
     await logUsage(supabase, {
       userId,
       feature,
+      propertyId,
       provider: "unknown",
       model: "unknown",
       usage: null,
@@ -92,32 +102,54 @@ export async function runAIJob(params: AIJobParams): Promise<AIJobResult> {
   }
 }
 
+/** Links a previously-logged AI call to the report row it produced, once that
+ * row exists (report creation happens after the AI call returns). */
+export async function attachReportId(usageLogId: string | null, reportId: string): Promise<void> {
+  if (!usageLogId) return;
+  try {
+    const supabase = createServiceClient();
+    await supabase.from("ai_usage_log").update({ report_id: reportId }).eq("id", usageLogId);
+  } catch (err) {
+    console.error("[ai/service] failed to attach report_id to ai_usage_log:", err);
+  }
+}
+
 async function logUsage(
   supabase: ReturnType<typeof createServiceClient>,
   entry: {
     userId: string;
     feature: string;
+    propertyId?: string;
     provider: string;
     model: string;
     usage: TokenUsage | null;
     succeeded: boolean;
     error: string | null;
   }
-): Promise<void> {
+): Promise<string | null> {
   try {
-    await supabase.from("ai_usage_log").insert({
-      user_id: entry.userId,
-      feature: entry.feature,
-      provider: entry.provider,
-      model: entry.model,
-      input_tokens: entry.usage?.inputTokens ?? null,
-      output_tokens: entry.usage?.outputTokens ?? null,
-      estimated_cost_usd: estimateCostUsd(entry.model, entry.usage),
-      succeeded: entry.succeeded,
-      error: entry.error,
-    });
+    const { data, error } = await supabase
+      .from("ai_usage_log")
+      .insert({
+        user_id: entry.userId,
+        property_id: entry.propertyId ?? null,
+        feature: entry.feature,
+        provider: entry.provider,
+        model: entry.model,
+        input_tokens: entry.usage?.inputTokens ?? null,
+        output_tokens: entry.usage?.outputTokens ?? null,
+        estimated_cost_usd: estimateCostUsd(entry.model, entry.usage),
+        succeeded: entry.succeeded,
+        error: entry.error,
+      })
+      .select("id")
+      .single();
+
+    if (error) throw error;
+    return data.id as string;
   } catch (err) {
     // Observability should never take down the actual feature.
     console.error("[ai/service] failed to write ai_usage_log:", err);
+    return null;
   }
 }
