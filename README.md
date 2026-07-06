@@ -8,6 +8,11 @@ Food/water optimization and pandemic/biosecurity tools (Features 2 & 3) are inte
 scope for this build — see [Roadmap](#roadmap) below for how they plug into the same schema and
 AI plumbing.
 
+**Before starting Feature 2**, Feature 1 needs a live validation pass against real (test-mode)
+infrastructure — see [`docs/LAUNCH_READINESS_REPORT.md`](./docs/LAUNCH_READINESS_REPORT.md) for
+current status, [`docs/STAGING_DEPLOYMENT.md`](./docs/STAGING_DEPLOYMENT.md) to set that up, and
+[`docs/VALIDATION_CHECKLIST.md`](./docs/VALIDATION_CHECKLIST.md) to run it.
+
 ## Stack
 
 - **Next.js 14** (App Router) + **TypeScript** + **Tailwind CSS**

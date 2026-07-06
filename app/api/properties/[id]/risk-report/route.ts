@@ -77,7 +77,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
   const idempotencyKey = request.headers.get("Idempotency-Key");
 
   try {
-    const { body, status } = await withIdempotency<{ report: RiskReport }>(
+    const { body, status, replayed } = await withIdempotency<{ report: RiskReport }>(
       supabase,
       { userId: user.id, endpoint: "risk-report", key: idempotencyKey },
       async () => {
@@ -131,7 +131,13 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
       }
     );
 
-    return NextResponse.json(body, { status });
+    // Surfaced mainly for manual/QA verification of idempotency behavior —
+    // "did this request trigger a new AI call, or replay a prior result?"
+    // without needing direct DB access.
+    return NextResponse.json(body, {
+      status,
+      headers: { "X-Idempotent-Replay": String(replayed) },
+    });
   } catch (err) {
     if (err instanceof IdempotencyInFlightError) {
       return NextResponse.json({ error: err.message }, { status: 409 });
