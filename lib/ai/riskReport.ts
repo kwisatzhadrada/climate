@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { generateStructuredText, ImageInput } from "@/lib/ai/client";
+import { ImageInput } from "@/lib/ai/client";
+import { runAIJob } from "@/lib/ai/service";
 import { ClimateSnapshot } from "@/lib/weather/openMeteo";
 import { RiskReportPayload } from "@/lib/types";
 
@@ -67,6 +68,7 @@ function extractJson(text: string): unknown {
 }
 
 export async function generateRiskReport(params: {
+  userId: string;
   label: string;
   address: string;
   lat: number;
@@ -74,7 +76,7 @@ export async function generateRiskReport(params: {
   climate: ClimateSnapshot;
   image?: ImageInput;
 }): Promise<{ payload: RiskReportPayload; model: string }> {
-  const { label, address, lat, lon, climate, image } = params;
+  const { userId, label, address, lat, lon, climate, image } = params;
 
   const prompt = `Property: ${label}
 Address: ${address}
@@ -95,7 +97,13 @@ ${image ? "\nA photo of the property is attached. Factor in visible roof materia
 
 Generate the JSON risk report now.`;
 
-  const result = await generateStructuredText({ system: SYSTEM_PROMPT, prompt, image });
+  const result = await runAIJob({
+    feature: "climate_risk_report",
+    userId,
+    system: SYSTEM_PROMPT,
+    prompt,
+    image,
+  });
   const parsed = extractJson(result.text);
   const payload = riskReportSchema.parse(parsed);
 

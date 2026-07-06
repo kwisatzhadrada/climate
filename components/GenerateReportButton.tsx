@@ -14,7 +14,13 @@ export function GenerateReportButton({ propertyId }: { propertyId: string }) {
     setError(null);
 
     try {
-      const res = await fetch(`/api/properties/${propertyId}/risk-report`, { method: "POST" });
+      const idempotencyKey =
+        typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+
+      const res = await fetch(`/api/properties/${propertyId}/risk-report`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+      });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Failed to generate report");
       router.refresh();

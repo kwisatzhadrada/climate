@@ -17,6 +17,8 @@ AI plumbing.
 - **Open-Meteo** — free, keyless geocoding, forecast, and 5-year historical extremes (swap for
   NASA POWER / a paid provider later for higher precision)
 - **Stripe** — subscription checkout + webhook (optional; app runs fine without it)
+- **Upstash Redis** (optional) — sliding-window rate limiting; falls back to an in-memory limiter
+  for local dev if unconfigured
 
 ## Scope refinements from the original brief
 
@@ -62,10 +64,15 @@ components/
   GenerateReportButton, RiskReportView
 lib/
   supabase/{client,server,middleware}.ts
-  weather/{geocode,openMeteo}.ts    Open-Meteo integrations
-  ai/{client,riskReport}.ts         Provider-agnostic AI call + prompt + schema
+  weather/{geocode,openMeteo,cache}.ts  Open-Meteo integrations + Postgres-backed caching
+  ai/{client,service,riskReport}.ts     client = provider transport, service = governed entry point
+  rateLimit.ts                      Burst/abuse protection (Upstash, in-memory fallback)
+  quota.ts                          Hard per-tier monthly caps (the financial backstop)
+  idempotency.ts                    Request-level idempotency for expensive/side-effecting calls
   types.ts
-supabase/migrations/001_initial.sql Schema, RLS policies, storage bucket
+supabase/migrations/
+  001_initial.sql                   Schema, RLS policies, storage bucket
+  002_hardening.sql                 stripe_events, idempotency_keys, climate_cache, ai_usage_log
 middleware.ts                       Session refresh + /dashboard route guard
 ```
 
@@ -80,9 +87,11 @@ npm install
 ### 2. Supabase project
 
 1. Create a project at [supabase.com](https://supabase.com).
-2. In the SQL editor, run `supabase/migrations/001_initial.sql`. This creates `profiles`,
+2. In the SQL editor, run `supabase/migrations/001_initial.sql`, then
+   `supabase/migrations/002_hardening.sql` in order. The first creates `profiles`,
    `properties`, `risk_reports`, RLS policies, the new-user trigger, and the public
-   `property-photos` storage bucket.
+   `property-photos` storage bucket; the second adds `stripe_events` (webhook dedupe),
+   `idempotency_keys`, `climate_cache`, and `ai_usage_log`.
 3. Copy your project URL, anon key, and service role key (Project Settings → API).
 
 ### 3. Environment variables
@@ -98,6 +107,9 @@ Fill in:
   `OPENAI_API_KEY` and set `AI_PROVIDER=openai`
 - Stripe keys only if you want live checkout; the app degrades gracefully without them (the
   "Upgrade" button returns a friendly "not configured yet" message instead of erroring).
+- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (free tier at [upstash.com](https://upstash.com))
+  — strongly recommended before public launch; without them, rate limiting silently falls back to
+  a single-instance in-memory limiter that does not protect a multi-instance deployment.
 
 ### 4. Run
 
@@ -134,32 +146,60 @@ Copy the printed webhook signing secret into `STRIPE_WEBHOOK_SECRET`.
    built to be screenshot-shareable — lean on that for organic/social marketing rather than
    building a separate share feature yet.
 
-## Risks, costs, and optimizations
+## Financial & operational hardening
 
-**AI cost per report**: one report = one multimodal call (~1-2K input tokens of prompt + climate
-data, optionally +1 image, ~1-2K output tokens of JSON). At Claude Sonnet pricing this is roughly
-$0.02–0.05/report; at GPT-4o similar. At 1,000 reports/month that's $20–50 — cheap relative to the
-$19/mo Premium price, but **meter it**: a free-tier user generating reports in a loop is your main
-cost-abuse vector. The MVP has no rate limiting yet — add a per-tier monthly report cap
-(check `risk_reports` count by `user_id` + date range) before public launch.
+Before starting Feature 2, the MVP got a pass to make it safe to leave unattended and to run on
+a real payment processor. What's now in place:
 
-**Weather API limits**: Open-Meteo's free tier is generous (10K calls/day) but not SLA-backed;
-if you scale past a few thousand reports/day, either cache climate snapshots per
-`(lat, lon)` rounded to ~1km for a day, or move to a paid provider.
+- **Hard monthly quota** (`lib/quota.ts`) — the actual financial backstop: 1 property / 3
+  reports per 30 days on Free, 5 / 100 on Premium, 50 / 1000 on Business. Enforced in Postgres
+  on every property-create and report-generate call, independent of any rate limiter, so a bug
+  or malicious script can never cost more than `maxReportsPerMonth × cost-per-report` per
+  account per month. Tune the numbers in `TIER_LIMITS` once you know real AI cost and margin.
+- **Burst-abuse rate limiting** (`lib/rateLimit.ts`) — Upstash Redis sliding window (5
+  reports/min, 10 property-creates/min, 10 checkout attempts/min) protects against a script
+  hammering an endpoint within the quota window. Falls back to an in-memory limiter if Upstash
+  isn't configured — fine for local dev, **not sufficient for a multi-instance production
+  deployment** (logs a one-time warning so this doesn't fail silently).
+- **Climate data caching** (`lib/weather/cache.ts`) — Open-Meteo responses are cached in
+  Postgres per ~1km lat/lon bucket for 6 hours, so regenerating a report (or two nearby
+  properties) doesn't re-hit the upstream API every time.
+- **Idempotency** (`lib/idempotency.ts`) — the report-generation endpoint accepts an
+  `Idempotency-Key` header; a retried request with the same key replays the original result
+  instead of re-running (and re-billing) the AI call. Uses a claim-row insert so genuinely
+  concurrent duplicate requests can't both slip through.
+- **Webhook security** (`app/api/stripe/webhook/route.ts`) — Stripe signature verification
+  (already required), plus event-id dedupe via `stripe_events` (Stripe retries on non-2xx and
+  can redeliver) and handling for `customer.subscription.updated`/`.deleted` so a cancelled or
+  lapsed subscription is downgraded back to `free` — the original version only ever upgraded
+  tiers on checkout, never downgraded, which is exactly the kind of gap that quietly leaks paid
+  access.
+- **Unified AI service layer** (`lib/ai/service.ts`) — the one place every feature's AI calls
+  should go through: enforces a 30s timeout per call (so a hung provider request can't tie up a
+  serverless invocation indefinitely), and logs every call's provider/model/token
+  usage/estimated cost/success to `ai_usage_log`. Deliberately does not add its own retry loop —
+  `lib/ai/client.ts` already falls back to a second provider once, and a visible failure that
+  lets the user re-click is safer than an automatic retry silently doubling spend on a flaky
+  request. Feature 2/3 AI calls should call `runAIJob(...)`, not `lib/ai/client.ts` directly.
 
-**Liability**: risk reports are AI-generated estimates, not licensed engineering/insurance advice.
-The disclaimer is shown on every report and the landing page — do not remove it, and don't let
-copy elsewhere imply certainty ("your home will flood") instead of estimate framing ("elevated
-flood risk based on..."). If you add per-region legal review before charging money in a given
-market, do it before the disclaimer language changes.
+**Still open** (call these out before public launch, not before Feature 2):
 
-**Vision payloads**: property photos are capped at 5MB in `fetchImageAsBase64` and silently
-skipped (not failed) if larger/unreachable, so a bad upload never blocks report generation —
-but very large photos still cost more in image tokens; consider client-side resizing on upload.
-
-**Security**: RLS policies restrict `properties`/`risk_reports` to their owning `user_id`; the
-service-role client (`createServiceClient`) is only used server-side in the Stripe webhook and
-must never be imported into a client component.
+- **Liability**: risk reports are AI-generated estimates, not licensed engineering/insurance
+  advice. The disclaimer is shown on every report and the landing page — do not remove it, and
+  don't let copy elsewhere imply certainty ("your home will flood") instead of estimate framing
+  ("elevated flood risk based on..."). Get regional legal review before changing that language.
+- **Vision payloads**: property photos are capped at 5MB in `fetchImageAsBase64` and silently
+  skipped (not failed) if larger/unreachable — a bad upload never blocks report generation, but
+  large photos still cost more in image tokens; consider client-side resizing on upload.
+- **Security**: RLS policies restrict `properties`/`risk_reports`/`ai_usage_log` to their owning
+  `user_id`; the service-role client (`createServiceClient`) is used server-side only (Stripe
+  webhook, climate cache, AI usage logging) and must never be imported into a client component.
+- **`ai_usage_log` pricing table** in `lib/ai/service.ts` is for cost *observability*, not
+  billing — it's a rough per-model $/1K-token estimate you should keep in sync with actual
+  provider pricing, not a source of truth for invoicing.
+- **Idempotency-key cleanup**: `idempotency_keys` rows aren't automatically pruned; call
+  `select public.prune_idempotency_keys();` from a scheduled job (or periodically by hand) once
+  you have one, per the comment in `002_hardening.sql`.
 
 ## Roadmap
 
@@ -170,5 +210,5 @@ must never be imported into a client component.
   early-warning dashboard.
 - Real-time severe-weather push alerts (needs a scheduled job + push/SMS provider).
 - Community resource matching and insurance affiliate integrations (needs partner data feeds).
-- Rate limiting / usage metering per subscription tier.
 - Swap Open-Meteo for NASA POWER or a paid provider for flood-plain/vegetation-index precision.
+- Scheduled pruning job for `idempotency_keys` and `stripe_events` (currently manual).

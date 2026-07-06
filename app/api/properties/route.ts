@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { geocodeAddress } from "@/lib/weather/geocode";
+import { checkRateLimit, RATE_LIMITS } from "@/lib/rateLimit";
+import { assertWithinPropertyQuota, getSubscriptionTier, QuotaExceededError } from "@/lib/quota";
 
 export async function POST(request: NextRequest) {
   const supabase = createClient();
@@ -12,11 +14,29 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
+  const rateLimit = await checkRateLimit(`property-create:${user.id}`, RATE_LIMITS.propertyCreate);
+  if (!rateLimit.success) {
+    return NextResponse.json(
+      { error: "Too many requests. Please slow down and try again shortly." },
+      { status: 429 }
+    );
+  }
+
   const body = await request.json();
   const { label, address, photo_url } = body ?? {};
 
   if (!label || typeof label !== "string" || !address || typeof address !== "string") {
     return NextResponse.json({ error: "label and address are required" }, { status: 400 });
+  }
+
+  try {
+    const tier = await getSubscriptionTier(supabase, user.id);
+    await assertWithinPropertyQuota(supabase, user.id, tier);
+  } catch (err) {
+    if (err instanceof QuotaExceededError) {
+      return NextResponse.json({ error: err.message }, { status: 403 });
+    }
+    throw err;
   }
 
   let geocoded;
